@@ -1,0 +1,174 @@
+---
+title: "A logistic regression model to classify short-circuitig SMPs"
+author: "Farshad Ebrahimi, OCT/27/2022"
+output: html_notebook
+---
+
+1.  **Background**
+
+    Short-circuiting is the process in which stormwater leaves the subsurface of green stormwater infrastructure (GSI) through unintended pathways (i.e., not through the orifice in lined systems, and in unintended flow paths for infiltration systems). The goal of this analysis is to correlate this phenomenon to GSI performance metrics and possibly other variables such as rain characteristics and to develop statistical tools which are capable of flagging short-circuiting SMP by providing predicting variables such as infiltration rates. Currently, the collection team flags SMPs with abnormally high infiltration rate as short-circuiting SMP (\> 5 in/hr). The analysis team is exploring tools to assess this flagging process and potentially optimize it to flag the SMPs more accurately. This will potentially reduce the backlog of SMPs that require further inspection by the collection team.
+
+    ![](images/sc.png)
+
+2.  **Data gathering**
+
+    This analysis is taking advantage of the most recent batch of SMP performance metrics and the latest categorization of SMPs into 4 categories of "Confirmed SC", "Confirmed not SC", "SC suspected", and "No SC suspected". There are other sources of data that can be used for the model development, such as rain characteristics and SMP design metrics, but this report is only focused on the infiltration rate as the sole predictor of short-circuiting.
+
+```{r}
+  #load libraries
+      library(pwdgsi)
+      library(odbc)
+      library(lubridate)
+      library(tidyverse)
+      library(stats)
+      library(gridExtra)
+      library(grid)
+      library(gtable)
+      library(ggtext)
+      library(dplyr)
+      library(ggplot2)
+      library(knitr)
+
+    #Stats libs
+      library(stats)
+      library(tidyverse)
+      library(ISLR)
+      library(e1071)
+      library(Metrics)
+
+    #DB connection
+      con <- odbc::dbConnect(odbc::odbc(), "mars_testing")
+      
+    #Load the most recent table of metrics
+
+      folder <- "//pwdoows/oows/Watershed Sciences/GSI Monitoring/06 Special Projects/48 Short-Circuiting GSI Data Analysis/Calculation Phase/Metrics Calculations"
+      analysis_date <- "2022-09-07"
+
+    #font size 
+      text_size = 20
+
+    #Import metric data from the CSV
+      csv_path <- paste(folder,analysis_date,"2022-09-07_metrics.csv" , sep ="/")
+      sc_metrics <- read.csv(csv_path)
+```
+
+Now that the metrics table is loaded, we can see that there are gaps in the data, and also there are metrics the are potentially intercorrelated based on our prior knowledge (RPSU and infiltration rate, for instance). One way to select the best predicting variable in data analysis of this kind is to perform t-test between the segments of data. For example, a t-test between the infiltration rate data set associated with short-circuiting SMPs and the infiltration rate data set associated with non short-circuiting SMPs. Visualizing the data sets is always the quickest way to qualitatively confirm the goodness of a predicitng variable and has been done in previous short-circuiting efforts, which shows a substantial difference between these two groups of infiltration rates.
+
+```{r}
+# what the data looks like
+    kable(sc_metrics[1:5,], caption = "First 5 Rows of SC Metrics Table")
+```
+
+3.  **Data prepping**
+
+    We have four categories of SMPs in the metrics table, but we only need two for this analysis. Our outcome should be Boolean, either short-circuiting (AKA 1) or non short-circuiting (AKA 0), so we need to aggregated the suspicous SMPs into SC or non-SC. We also need to remove the data with gaps for the sake of this analysis. It is worth noting that each SMP in the metrics table might be associated with multiple station storms, hence, one way to proceed with this analysis is to aggregate the metrics by SMP ID through calculating average (robust mean with removing outlier values). There are other ways for doing this, such as categorizing individual station storms rather than SMPs.
+
+```{r}
+ sc_data <- sc_metrics %>%
+    filter(sc_category == "No SC suspected" | sc_category == "Confirmed SC" | sc_category == "Confirmed not SC"| sc_category == "SC suspected") %>%
+    select(smp_id, sc_category,infiltration_inhr) %>%
+    mutate(sc = case_when(
+      sc_category == "Confirmed SC" ~ 1,
+      sc_category == "SC suspected" ~ 1,
+      sc_category == "No SC suspected" ~ 0,
+      sc_category == "Confirmed not SC" ~ 0
+    )) %>%
+    na.omit()
+ 
+ #Aggregating metrics
+  sc_data <- sc_data %>%
+    group_by(smp_id, sc) %>%
+    summarise(infiltration_inhr = mean(infiltration_inhr,trim = 0.1))
+
+```
+
+4.  **Logistic regression model**
+
+    The goal of this section is to perform a logistic regression model which is a classification algorithm with Boolean outcome. This algorithm assigns a value between 0-1 to each SMP in the data set (probability of short-circuiting). This in turn will help with establishing a threshold for flagging the SMPs. For example, SMPs with \> 50% chance of short-circuiting may be flagged. In summary, this method is a popular classification method for the type of analysis that only results in a binary outcome. The code chunk below is performing logistic regression analysis with only one predicting variable, infiltration rate. The p-value (1.41e-10) is much smaller than 0.05, which confirms that infiltration rate is a significant variable for predicting short-circuiting.
+
+```{r}
+ #Logistic regression using the binomial family
+  simple_logistic_model = glm(data = sc_data,
+                              sc ~ infiltration_inhr,
+                              family = binomial())
+  
+  summary(simple_logistic_model)
+  #plot
+  sc_data$lr_log_odds = predict(simple_logistic_model)
+  sc_data$logistic_predictions = predict(simple_logistic_model, type = "response")
+  
+  probab_plot <- sc_data %>%
+    ggplot(aes(x = infiltration_inhr,
+               y = logistic_predictions)) +
+    geom_point() +
+    labs(y = "Probability of short-circuiting",
+         title = "Probability of short-circuiting vs Infiltration Rate") +
+    theme_minimal() +
+    geom_hline(aes(yintercept = 0.5,color="red")) +
+        geom_vline(aes(xintercept = 8.1,color="red")) +
+    annotate('text', x = 6.7, y = 0.53, label = '(8.58,0.51)')+
+    theme(legend.position="none")
+
+```
+
+The statistical summary above can be converted into a simple plot. The following plot shows the probability distribution of short-circuiting based on infiltration rate. As it is shown in the plot, SMPs with average infiltration rate of 8.58 in/hr or greater have \> 50% chance of short-circuiting.
+
+```{r}
+plot(probab_plot)
+```
+
+5.  **Model performance**
+
+    Now that the model is developed, it is necessary to evaluate its performance. It is also essential to compare these metrics with the current QA process performance. The most well-known metric is accuracy, which is the fraction of the total number of correct predictions. We also need to develop a confusion matrix that lists 4 numbers; true positives, false positives, true negatives, and false negatives in a table. This will outline the detailed performance of the model in each aspect. The overall accuracy of the model is around 70%, but we are interested in the details of the performance and how it performs in each predicted category (0 and 1). As it is shown in the confusion matrix, the total number of flagged SMPs (predicted status = 1) is 23 (15+8), of which 15 SMPs are actually short-circuiting which equals to \~ 65% accuracy rate. It is also important to look at the fraction of the short-circuiting SMPs that were misclassified to non short-circuiting, as we do not want to lose track of those.
+
+```{r}
+#performance accuracy
+sc_data <- sc_data %>%
+    mutate(predictions = case_when(
+      logistic_predictions < 0.5  ~  0,
+      logistic_predictions > 0.5  ~  1
+      
+      
+  ))
+# calculate auc, accuracy, clasification error
+accuracy <- accuracy(sc_data$sc, sc_data$predictions)
+classification_error <- ce(sc_data$sc, sc_data$predictions) 
+
+# print out the metrics on to screen
+print(paste("Accuracy=", accuracy))
+print(paste("Classification Error=", classification_error))
+
+# confusion matrix
+table(sc_data$sc, sc_data$predictions, dnn=c("True Status", "Predicted Status")) # confusion matrix
+
+```
+
+6.  **QA workflow performance**
+
+The current QA process uses a infiltration rate threshold of 5 in/hr, which is a simple predicting model and its performance metrics (accuracy and confusion matrix) can be developed in a similar fashion. The overall accuracy of the QA process is also around 70%, however, as it is shown in the confusion matrix, the total number of flagged SMPs (predicted status = 1) is 43, which is more than that of the logistic regression model, of which 23 SMPs are actually short-circuiting (\~53% success rate).
+
+```{r}
+#performance accuracy
+sc_data <- sc_data %>%
+    mutate(qa_predictions = case_when(
+      infiltration_inhr < 5  ~  0,
+      infiltration_inhr > 5  ~  1
+      
+      
+  ))
+# calculate auc, accuracy, clasification error
+qa_accuracy <- accuracy(sc_data$sc, sc_data$qa_predictions)
+qa_classification_error <- ce(sc_data$sc, sc_data$qa_predictions) 
+
+# print out the metrics on to screen
+print(paste("QA Accuracy=", accuracy))
+print(paste("QA Classification Error=", classification_error))
+
+# confusion matrix
+table(sc_data$sc, sc_data$qa_predictions, dnn=c("True Status", "Predicted Status")) # confusion matrix
+
+```
+
+7.  **Conclusion**
+
+The statistical analysis performed in this report is an example of the type of exploratory work that can be performed to optimize some of the workflows within MARS. It should be noted that there are other models, predicting variables, and data prepping techniques that can be applied to improve this work. It is also important to delineate the most desired outcomes by asking questions like "what do we care more about? minimizing false positives or minimizing false negatives?" , "where do we stand with regard to the backlog of flagged SMPs? Do we need to cut down our flagged SMPs by compromising a bit of accuracy?".
